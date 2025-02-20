@@ -25,11 +25,14 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+import com.pm.nb_serving.api.thriftjava.FeatureValues;
+import com.pm.nb_serving.api.thriftjava.PredictionRequest;
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.apache.druid.data.input.InputRow;
@@ -118,26 +121,40 @@ public class ThriftInputRowParser implements InputRowParser<Object>
     }
 
     final String json;
+    PredictionRequest predictionRequest = new PredictionRequest();
     try {
       if (input instanceof ByteBuffer) { // realtime stream
         final byte[] bytes = ((ByteBuffer) input).array();
-        TBase o = thriftClass.newInstance();
-        ThriftDeserialization.detectAndDeserialize(bytes, o);
-        json = ThriftDeserialization.SERIALIZER_SIMPLE_JSON.get().toString(o);
-//      } else if (input instanceof BytesWritable) { // sequence file
-//        final byte[] bytes = ((BytesWritable) input).getBytes();
-//        TBase o = thriftClass.newInstance();
-//        ThriftDeserialization.detectAndDeserialize(bytes, o);
-//        json = ThriftDeserialization.SERIALIZER_SIMPLE_JSON.get().toString(o);
-//      } else if (input instanceof ThriftWritable) { // LzoBlockThrift file
-//        TBase o = (TBase) ((ThriftWritable) input).get();
-//        json = ThriftDeserialization.SERIALIZER_SIMPLE_JSON.get().toString(o);
+        ThriftDeserialization.detectAndDeserialize(bytes, predictionRequest);
+        json = ThriftDeserialization.SERIALIZER_SIMPLE_JSON.get().toString(predictionRequest);
       } else {
         throw new IAE("unsupport input class of [%s]", input.getClass());
       }
-    }
-    catch (IllegalAccessException | InstantiationException | TException e) {
+    } catch (TException e) {
       throw new IAE("some thing wrong with your thrift?");
+    }
+
+    // 把PredictionRequest按照Item来摊平
+    Map<String, FeatureValues> contextFeature = predictionRequest.getContext().getFeatureValues();
+    Map<String, Object> contextMap = new HashMap<>(contextFeature.size());
+    for (Map.Entry<String, FeatureValues> entry : contextFeature.entrySet()) {
+      String featureName = entry.getKey();
+      switch (entry.getValue().getSetField()) {
+        case DENSE_FEATURES:
+          Double denseValue = entry.getValue().getDenseFeatures().get(0);
+          contextMap.put(featureName, denseValue);
+          break;
+        case SPARSE_FEATURES:
+          List<String> sparseValue = entry.getValue().getSparseFeatures().get(0);
+          contextMap.put(featureName, sparseValue);
+        case EMBEDDING_FEATURES:
+
+      }
+    }
+    for (Map.Entry<String, FeatureValues> itemEntry : predictionRequest.getFeatures()
+        .getFeatureValues()
+        .entrySet()) {
+
     }
 
     Map<String, Object> record = parser.parseToMap(json);

@@ -33,6 +33,12 @@
       <artifactId>jackson-databind</artifactId>
       <version>2.14.2</version>
     </dependency>
+    <!--  NbServing 依赖  -->
+    <dependency>
+      <groupId>com.pm</groupId>
+      <artifactId>nb-serving-api</artifactId>
+      <version>0.1.11</version>
+    </dependency>
   </dependencies>
 
   <build>
