@@ -22,16 +22,12 @@ package org.apache.durid.data.input.feature_monitor;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 import com.pm.nb_serving.api.thriftjava.FeatureValues;
 import com.pm.nb_serving.api.thriftjava.PredictionRequest;
-import java.io.File;
-import java.io.IOException;
-import java.net.URL;
-import java.net.URLClassLoader;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -45,12 +41,11 @@ import org.apache.thrift.TBase;
 import org.apache.thrift.TException;
 
 /**
- * 1. load thrift class from classpath or provided jar
- * 2. deserialize content bytes and serialize to json
- * 3. use JsonSpec to do things left
+ * 1. load thrift class from classpath or provided jar 2. deserialize content bytes and serialize to
+ * json 3. use JsonSpec to do things left
  */
-public class ThriftInputRowParser implements InputRowParser<Object>
-{
+public class ThriftInputRowParser implements InputRowParser<Object> {
+
   private final ParseSpec parseSpec;
   private final String jarPath;
   private final String thriftClassName;
@@ -64,8 +59,7 @@ public class ThriftInputRowParser implements InputRowParser<Object>
       @JsonProperty("parseSpec") ParseSpec parseSpec,
       @JsonProperty("thriftJar") String jarPath,
       @JsonProperty("thriftClass") String thriftClassName
-  )
-  {
+  ) {
     this.jarPath = jarPath;
     this.thriftClassName = thriftClassName;
     Preconditions.checkNotNull(thriftClassName, "thrift class name");
@@ -74,59 +68,14 @@ public class ThriftInputRowParser implements InputRowParser<Object>
     this.dimensions = parseSpec.getDimensionsSpec().getDimensionNames();
   }
 
-  @SuppressWarnings("ReturnValueIgnored")
-  public Class<TBase> getThriftClass()
-      throws IOException, ClassNotFoundException, IllegalAccessException, InstantiationException
-  {
-    final Class<TBase> thrift;
-    if (jarPath != null) {
-      File jar = new File(jarPath);
-      URLClassLoader child = new URLClassLoader(
-          new URL[]{jar.toURI().toURL()},
-          this.getClass().getClassLoader()
-      );
-      thrift = (Class<TBase>) Class.forName(thriftClassName, true, child);
-    } else {
-      thrift = (Class<TBase>) Class.forName(thriftClassName);
-    }
-    thrift.newInstance();
-    return thrift;
-  }
-
 
   @Override
-  public List<InputRow> parseBatch(Object input)
-  {
-    if (parser == null) {
-      // parser should be created when it is really used to avoid unnecessary initialization of the underlying
-      // parseSpec.
-      parser = parseSpec.makeParser();
-    }
-
-    // There is a Parser check in phase 2 of mapreduce job, thrift jar may not present in peon side.
-    // Place it this initialization in constructor will get ClassNotFoundException
-    try {
-      if (thriftClass == null) {
-        thriftClass = getThriftClass();
-      }
-    }
-    catch (IOException e) {
-      throw new IAE(e, "failed to load jar [%s]", jarPath);
-    }
-    catch (ClassNotFoundException e) {
-      throw new IAE(e, "class [%s] not found in jar", thriftClassName);
-    }
-    catch (InstantiationException | IllegalAccessException e) {
-      throw new IAE(e, "instantiation thrift instance failed");
-    }
-
-    final String json;
+  public List<InputRow> parseBatch(Object input) {
     PredictionRequest predictionRequest = new PredictionRequest();
     try {
       if (input instanceof ByteBuffer) { // realtime stream
         final byte[] bytes = ((ByteBuffer) input).array();
         ThriftDeserialization.detectAndDeserialize(bytes, predictionRequest);
-        json = ThriftDeserialization.SERIALIZER_SIMPLE_JSON.get().toString(predictionRequest);
       } else {
         throw new IAE("unsupport input class of [%s]", input.getClass());
       }
@@ -135,9 +84,10 @@ public class ThriftInputRowParser implements InputRowParser<Object>
     }
 
     // 把PredictionRequest按照Item来摊平
-    Map<String, FeatureValues> contextFeature = predictionRequest.getContext().getFeatureValues();
-    Map<String, Object> contextMap = new HashMap<>(contextFeature.size());
-    for (Map.Entry<String, FeatureValues> entry : contextFeature.entrySet()) {
+    int contextFeatureCount = predictionRequest.getContext().getFeatureValuesSize();
+    Map<String, Object> contextMap = new HashMap<>(contextFeatureCount);
+    for (Map.Entry<String, FeatureValues> entry : predictionRequest.getContext().getFeatureValues()
+        .entrySet()) {
       String featureName = entry.getKey();
       switch (entry.getValue().getSetField()) {
         case DENSE_FEATURES:
@@ -147,41 +97,67 @@ public class ThriftInputRowParser implements InputRowParser<Object>
         case SPARSE_FEATURES:
           List<String> sparseValue = entry.getValue().getSparseFeatures().get(0);
           contextMap.put(featureName, sparseValue);
+          break;
         case EMBEDDING_FEATURES:
-
+          List<Double> embeddingValue = entry.getValue().getEmbeddingFeatures().get(0);
+          contextMap.put(featureName, embeddingValue);
+          break;
+        default:
+          throw new RuntimeException("unsupported featureType");
       }
+    }
+    int batchSize = (int) predictionRequest.getFeatures().getBatchSize();
+    int totalFeatureCount =
+        contextFeatureCount + predictionRequest.getFeatures().getFeatureValuesSize();
+    List<Map<String, Object>> result = Lists.newArrayListWithCapacity(batchSize);
+    for (int i = 0; i < predictionRequest.getFeatures().getBatchSize(); i++) {
+      Map<String, Object> objectMap = new HashMap<>(totalFeatureCount);
+      objectMap.putAll(contextMap);
+      result.add(objectMap);
     }
     for (Map.Entry<String, FeatureValues> itemEntry : predictionRequest.getFeatures()
         .getFeatureValues()
         .entrySet()) {
-
+      String featureName = itemEntry.getKey();
+      switch (itemEntry.getValue().getSetField()) {
+        case DENSE_FEATURES:
+          for (int i = 0; i < batchSize; i++) {
+            Double denseValue = itemEntry.getValue().getDenseFeatures().get(i);
+            result.get(i).put(featureName, denseValue);
+          }
+          break;
+        case SPARSE_FEATURES:
+          for (int i = 0; i < batchSize; i++) {
+            List<String> sparseValue = itemEntry.getValue().getSparseFeatures().get(i);
+            result.get(i).put(featureName, sparseValue);
+          }
+          break;
+        case EMBEDDING_FEATURES:
+          for (int i = 0; i < batchSize; i++) {
+            List<Double> embeddingValue = itemEntry.getValue().getEmbeddingFeatures().get(i);
+            result.get(i).put(featureName, embeddingValue);
+          }
+          break;
+        default:
+          throw new RuntimeException("unsupported featureType");
+      }
     }
 
-    Map<String, Object> record = parser.parseToMap(json);
-    final List<String> dimensions;
-    if (!this.dimensions.isEmpty()) {
-      dimensions = this.dimensions;
-    } else {
-      dimensions = Lists.newArrayList(
-          Sets.difference(record.keySet(), parseSpec.getDimensionsSpec().getDimensionExclusions())
-      );
+    List<InputRow> rows = new ArrayList<>(result.size());
+    for (int i = 0; i < batchSize; i++) {
+      rows.add(new MapBasedInputRow(System.currentTimeMillis(), Collections.emptyList(),
+          result.get(i)));
     }
-    return ImmutableList.of(new MapBasedInputRow(
-        parseSpec.getTimestampSpec().extractTimestamp(record),
-        dimensions,
-        record
-    ));
+    return rows;
   }
 
   @Override
-  public ParseSpec getParseSpec()
-  {
+  public ParseSpec getParseSpec() {
     return parseSpec;
   }
 
   @Override
-  public InputRowParser withParseSpec(ParseSpec parseSpec)
-  {
+  public InputRowParser withParseSpec(ParseSpec parseSpec) {
     return new ThriftInputRowParser(parseSpec, jarPath, thriftClassName);
   }
 }
